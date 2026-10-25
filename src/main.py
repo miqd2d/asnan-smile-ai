@@ -1,5 +1,8 @@
 import logging
 
+from agent import loop as agent, calls
+from agent.chat_schemas import ChatStartOut, ChatIn, ChatOut, CallLogOut, HandoffOut
+
 from fastapi import FastAPI, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -88,3 +91,30 @@ def cancelAppointment(appointment_id : int, body : TokenRequest):
 @app.post("/appointments/{appointment_id}/confirm",tags=["Appointments"],responses=errors( 401, 404, 409), status_code=200)
 def confirmAppointment(appointment_id : int, body : TokenRequest):
     return pms.confirm_appointment(token=body.token, appointment_id=appointment_id)
+
+
+# _______________________________AGENT-API__________________________________
+
+@app.post("/chat/start", response_model=ChatStartOut, tags=["Chat"])
+def chat_start():
+    return agent.start_session()
+
+
+@app.post("/chat", response_model=ChatOut, tags=["Chat"])
+def chat(body: ChatIn):
+    return agent.handle_message(body.session_id, body.message)
+
+
+@app.post("/chat/{session_id}/end", response_model=CallLogOut, tags=["Chat"])
+def chat_end(session_id: str):
+    return agent.end_session(session_id)
+
+
+@app.get("/call-logs", response_model=list[CallLogOut], tags=["Dashboard"])
+def call_logs(limit: int = 50):
+    return calls.list_call_logs(limit)
+
+
+@app.get("/handoffs", response_model=list[HandoffOut], tags=["Dashboard"])
+def handoffs(status: str = "open"):
+    return calls.list_handoffs(status)
