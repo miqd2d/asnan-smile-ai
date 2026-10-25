@@ -12,8 +12,11 @@ TIME_PATTERN = r"^([01]\d|2[0-3]):[0-5]\d$"  # 14:30
 
 # ---------------------------------------------------------- requests
 class VerifyRequest(BaseModel):
-    patient_id: int = Field(gt=0, description="Patient file number")
-    name: str = Field(min_length=2, max_length=100, description="Name as the caller says it")
+    patient_id: int = Field(gt=0, description="Patient file number (required)")
+    name: str | None = Field(default=None, min_length=2, max_length=100,
+                             description="Any part of the name, e.g. 'Abdullah' or 'Al Saffar'. Titles ignored.")
+    phone: str | None = Field(default=None, max_length=25,
+                              description="Phone number; only the last 8 digits are compared, so +965 is optional")
 
 
 class CreateAppointmentRequest(BaseModel):
@@ -44,6 +47,7 @@ class VerifyResponse(BaseModel):
     token: str
     patient_id: int
     first_name: str
+    matched_on: list[str] = Field(description="Which details matched: 'name' and/or 'phone'")
 
 
 class UnitOut(BaseModel):

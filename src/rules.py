@@ -125,6 +125,9 @@ def check_owner_and_changeable(row, patient_id: int) -> None:
 
 # --------------------------------------------------------------- identity
 _TITLES = {"mr", "mrs", "ms", "miss", "dr", "sheikh", "mstr", "baby"}
+_PARTICLES = {"al", "el", "bin", "bint", "ibn", "abu", "abo", "um"}   # too common to match on alone
+_DIGRAPHS = (("kh", "k"), ("gh", "g"), ("dh", "d"), ("th", "t"), ("sh", "s"), ("ph", "f"), ("ou", "u"))
+_VOWELS = str.maketrans({"e": "a", "o": "u", "y": "i"})
 
 
 def _tokens(name: str) -> list[str]:
@@ -132,19 +135,40 @@ def _tokens(name: str) -> list[str]:
     return [t for t in cleaned.split() if t not in _TITLES]
 
 
+def _soft(word: str) -> str:
+    """Flatten common Arabic-to-English spelling variants: Ahmed/Ahmad, Mohammed/Muhammad, Khaled/Kaled."""
+    for a, b in _DIGRAPHS:
+        word = word.replace(a, b)
+    word = word.translate(_VOWELS)
+    return re.sub(r"(.)\1+", r"\1", word)          # collapse double letters
+
+
+def _candidates(tokens: list[str]) -> set[str]:
+    """Every single word, plus neighbouring words glued together ('al' + 'saffar' -> 'alsaffar')."""
+    cands = {t for t in tokens if t not in _PARTICLES}
+    cands |= {t[2:] for t in tokens if t[:2] in ("al", "el") and len(t) > 4}   # 'alsaffar' -> 'saffar'
+    cands |= {a + b for a, b in zip(tokens, tokens[1:])}
+    if len(tokens) > 1:
+        cands.add("".join(tokens))
+    return {_soft(c) for c in cands if len(c) >= 3}
+
+
 def name_matches(spoken: str, stored: str) -> bool:
     """
-    Forgiving but safe name comparison (speech-to-text mangles spellings).
-    Accepts if the whole names are very similar, OR every spoken word fuzzy-matches
-    a stored word and the caller gave at least two words (if the record has two or more).
-    A single first name alone is never enough.
+    Loose name check - ONE meaningful part is enough ('Abdullah' or 'Saffar' or 'Al Saffar').
+    Titles are ignored; 'al/bin/abu' alone never counts; spelling variants are tolerated.
+    Safe only because the patient ID is required as well.
     """
-    a, b = _tokens(spoken), _tokens(stored)
-    if not a or not b:
-        return False
-    t = config.NAME_MATCH_THRESHOLD
-    compact = SequenceMatcher(None, "".join(sorted(a)), "".join(sorted(b))).ratio()
-    if compact >= t:
-        return True
-    covered = all(any(SequenceMatcher(None, x, y).ratio() >= t for y in b) for x in a)
-    return covered and len(a) >= min(2, len(b))
+    spoken_c, stored_c = _candidates(_tokens(spoken)), _candidates(_tokens(stored))
+    for x in spoken_c:
+        need = max(config.NAME_MATCH_THRESHOLD, 0.9) if len(x) <= 4 else config.NAME_MATCH_THRESHOLD
+        if any(SequenceMatcher(None, x, y).ratio() >= need for y in stored_c):
+            return True
+    return False
+
+
+def phone_matches(spoken: str, stored: str) -> bool:
+    """Compare the last 8 digits, so +965 / 00965 / spaces / dashes do not matter."""
+    n = config.PHONE_DIGITS
+    a, b = re.sub(r"\D", "", spoken or ""), re.sub(r"\D", "", stored or "")
+    return len(a) >= n and len(b) >= n and a[-n:] == b[-n:]

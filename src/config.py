@@ -28,7 +28,12 @@ CHANGE_MIN_NOTICE_HOURS = 24      # cancel / reschedule needs this much notice
                                   # ASSUMPTION: confirm the real policy with the clinic.
 
 # ---- Identity verification ------------------------------------------------
-NAME_MATCH_THRESHOLD = 0.85       # how close the spoken name must be (0-1)
+# Patient ID is always required. On top of it the caller must match this many of the
+# optional extras (name, phone):  1 = recommended,  0 = patient ID only (demo-simple, but
+# anyone who guesses an ID could view/cancel that patient's appointments).
+VERIFY_FACTORS_REQUIRED = 1
+NAME_MATCH_THRESHOLD = 0.85       # how close a spoken name part must be (0-1)
+PHONE_DIGITS = 8                  # Kuwait numbers are 8 digits; +965 / 00965 prefixes are ignored
 MAX_VERIFY_ATTEMPTS = 3           # failed attempts per patient ID before lock-out
 VERIFY_LOCKOUT_MIN = 15
 TOKEN_TTL_MIN = 15                # a verification token expires after this
@@ -43,7 +48,6 @@ STATUS_CANCEL = "Cancel"
 STATUS_RESCHEDULE = "Reschedule"           # closed (old) version of a moved appointment
 CHANGEABLE_STATUSES = (STATUS_BOOK, STATUS_CONFIRM, "Rescheduled")
 
-VERIFY_FACTORS_REQUIRED = 1   # 0 = patient ID only
 
 def get_now() -> datetime:
     """Current time. Set DEMO_NOW=2026-10-26T09:00 to freeze the clock for demos/tests."""

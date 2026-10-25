@@ -33,34 +33,50 @@ def reset_security_state() -> None:
 
 
 # =========================================================== identity
-def verify_patient(patient_id: int, name: str) -> dict:
-    """Check patient ID + spoken name together. Returns a token on success."""
+def verify_patient(patient_id: int, name: str | None = None, phone: str | None = None) -> dict:
+    """
+    Patient ID (required) + enough of the optional extras (name, phone) to reach
+    config.VERIFY_FACTORS_REQUIRED. Names and phones are matched loosely (see rules.py).
+    Returns a short-lived token on success.
+    """
     now = config.get_now()
+    name, phone = (name or "").strip() or None, (phone or "").strip() or None
     attempts, locked_until = _failed.get(patient_id, (0, None))
     if locked_until and now < locked_until:
         raise RuleError("LOCKED_OUT", "Too many failed attempts. I will transfer you "
                         "to a team member.", 429)
+    if (name is not None) + (phone is not None) < config.VERIFY_FACTORS_REQUIRED:
+        # not a failed attempt: the caller simply has not been asked for enough yet
+        raise RuleError("MORE_INFO_NEEDED", "Please also tell me the phone number "
+                        "or the name on the file.", 400)
 
     con = connect()
     try:
-        row = con.execute("SELECT patient_id, name FROM patients WHERE patient_id = ?",
+        row = con.execute("SELECT patient_id, name, phone FROM patients WHERE patient_id = ?",
                           (patient_id,)).fetchone()
     finally:
         con.close()
 
-    if not row or not rules.name_matches(name, row["name"]):
+    matched = []
+    if row and name and rules.name_matches(name, row["name"]):
+        matched.append("name")
+    if row and phone and rules.phone_matches(phone, row["phone"]):
+        matched.append("phone")
+
+    if not row or len(matched) < config.VERIFY_FACTORS_REQUIRED:
         attempts += 1
         locked = now + timedelta(minutes=config.VERIFY_LOCKOUT_MIN) \
             if attempts >= config.MAX_VERIFY_ATTEMPTS else None
         _failed[patient_id] = (attempts, locked)
-        # one generic message: never reveal whether the ID or the name was wrong
+        # one generic message: never reveal which detail was wrong
         raise RuleError("VERIFICATION_FAILED", "I could not verify those details.", 403)
 
     _failed.pop(patient_id, None)
     token = secrets.token_urlsafe(16)
     _tokens[token] = (patient_id, now + timedelta(minutes=config.TOKEN_TTL_MIN))
     first = (rules._tokens(row["name"]) or ["there"])[0].capitalize()
-    return {"verified": True, "token": token, "patient_id": patient_id, "first_name": first}
+    return {"verified": True, "token": token, "patient_id": patient_id,
+            "first_name": first, "matched_on": matched}
 
 
 def _require_patient(token: str) -> int:
