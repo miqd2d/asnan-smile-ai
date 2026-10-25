@@ -19,6 +19,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def errors(*codes):
+    """Shows the standard error body for these status codes in /docs."""
+    return {c: {"model": ErrorOut, "description": "Rule or validation error"} for c in codes}
+
 
 # ---------- error handling ----------
 @app.exception_handler(RuleError)
@@ -53,34 +57,34 @@ def get_visit_types():
 def getDoctor(name : str | None = None, unit_id : int | None = None):
     return pms.list_doctors(unit_id=unit_id , name=name)
 
-@app.get("/slots" , response_model=SlotsOut, tags=["Availability"],status_code=200)
+@app.get("/slots" , response_model=SlotsOut, tags=["Availability"], responses=errors(400, 404), status_code=200)
 def getSlots(doctor_id : int, date : str, rov_id : int):
     return pms.get_slots(doctor_id=doctor_id, date = date, rov_id=rov_id)
 
-@app.get("/next-available", response_model=list[SlotOption],tags=["Availability"], status_code=200)
+@app.get("/next-available", response_model=list[SlotOption],tags=["Availability"],responses=errors(400, 404), status_code=200)
 def getNextSlotsAvailable(rov_id : int, doctor_id : int | None = None, unit_id : int | None = None , from_date : str | None  = None , days_ahead : int = 14 ,limit: int = 4):
     return pms.get_next_available(rov_id=rov_id, doctor_id=doctor_id, unit_id=unit_id, from_date=from_date, days_ahead=days_ahead, limit=limit  )
 
-@app.post("/patients/verify", response_model=VerifyResponse, tags=["Identity"], status_code=200)
+@app.post("/patients/verify", response_model=VerifyResponse, tags=["Identity"],responses=errors(400, 403, 429), status_code=200)
 def verify(body: VerifyRequest):
     return pms.verify_patient(body.patient_id, body.name, body.phone)
 
-@app.get("/patients/me/appointments" , response_model=list[AppointmentOut],tags=["Appointments"], status_code=200)
+@app.get("/patients/me/appointments" , response_model=list[AppointmentOut],tags=["Appointments"],responses=errors(401), status_code=200)
 def getAppointments(verification_token = Header(alias="X-Verification-Token"),upcoming_only : bool = True):
     return pms.get_patient_appointments(token=verification_token, upcoming_only=upcoming_only)
 
-@app.post("/appointments", response_model=AppointmentOut ,tags=["Appointments"], status_code=201)
+@app.post("/appointments", response_model=AppointmentOut ,tags=["Appointments"],responses=errors(400, 401, 404, 409), status_code=201)
 def postAppointment(body: CreateAppointmentRequest):
     return pms.create_appointment(token=body.token, doctor_id=body.doctor_id, rov_id=body.rov_id, date=body.date, time=body.time, notes=body.notes)
 
-@app.post("/appointments/{appointment_id}/reschedule" , response_model=AppointmentOut,tags=["Appointments"], status_code=200)
+@app.post("/appointments/{appointment_id}/reschedule" , response_model=AppointmentOut,tags=["Appointments"],responses=errors(400, 401, 404, 409), status_code=200)
 def rescheduleAppointment(appointment_id : int , body : RescheduleRequest):
     return pms.reschedule_appointment(token=body.token,appointment_id=appointment_id, new_date=body.new_date, new_time=body.new_time, new_doctor_id=body.new_doctor_id)
 
-@app.post("/appointments/{appointment_id}/cancel" , response_model=AppointmentOut,tags=["Appointments"], status_code=200)
+@app.post("/appointments/{appointment_id}/cancel" , response_model=AppointmentOut,tags=["Appointments"],responses=errors( 401, 404, 409), status_code=200)
 def cancelAppointment(appointment_id : int, body : TokenRequest):
     return pms.cancel_appointment(token=body.token, appointment_id=appointment_id)
 
-@app.post("/appointments/{appointment_id}/confirm",tags=["Appointments"], status_code=200)
+@app.post("/appointments/{appointment_id}/confirm",tags=["Appointments"],responses=errors( 401, 404, 409), status_code=200)
 def confirmAppointment(appointment_id : int, body : TokenRequest):
     return pms.confirm_appointment(token=body.token, appointment_id=appointment_id)
