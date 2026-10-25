@@ -56,10 +56,38 @@ def spoken(stored):                               # "Ms. tibah mohammad alnomas"
 
 
 print("\n== Identity")
+from rules import name_matches, phone_matches     # noqa: E402
+con = sqlite3.connect(tmp)
+phone_a = con.execute("SELECT phone FROM patients WHERE patient_id=?", (pa[0],)).fetchone()[0]
+con.close()
+ALS = "Mr. abdullah hadi Alsaffar"                 # patient 1188 from your data
+check("one word is enough: 'Abdullah'", name_matches("Abdullah", ALS))
+check("one word is enough: 'Saffar'", name_matches("Saffar", ALS))
+check("'Al Saffar' (spoken apart) matches 'Alsaffar'", name_matches("Al Saffar", ALS))
+check("title in speech ignored", name_matches("Mr Abdullah", ALS))
+check("spelling variant: Abdulla", name_matches("Abdulla", ALS))
+check("spelling variant: Ahmad vs AHMED", name_matches("Ahmad", "Mr. AHMED ALI GHALOOM"))
+check("spelling variant: Mohamed vs Mohammad", name_matches("Mohamed", "Ms. tibah mohammad alnomas"))
+check("different name refused", not name_matches("Khalid", ALS))
+check("'Al' alone refused", not name_matches("Al", ALS))
+check("title alone refused", not name_matches("Mr", ALS))
+check("phone: +965 prefix ignored", phone_matches("+965 " + phone_a[-8:], phone_a))
+check("phone: 00965 and dashes ignored", phone_matches("00965-" + phone_a[-8:-4] + "-" + phone_a[-4:], phone_a))
+check("phone: too short refused", not phone_matches(phone_a[-4:], phone_a))
+
 pms.reset_security_state()
+check("ID + one name word accepted", pms.verify_patient(pa[0], spoken(pa[1]).split()[0])["matched_on"] == ["name"])
+check("ID + last name word accepted", pms.verify_patient(pa[0], spoken(pa[1]).split()[-1])["verified"])
+check("ID + phone accepted", pms.verify_patient(pa[0], phone=phone_a[-8:])["matched_on"] == ["phone"])
+check("phone right, name wrong still accepted (STT may mangle names)",
+      pms.verify_patient(pa[0], name="Nobody", phone=phone_a)["matched_on"] == ["phone"])
 check("wrong name refused", raises("VERIFICATION_FAILED", pms.verify_patient, pa[0], "John Smith"))
-check("first name only refused", raises("VERIFICATION_FAILED", pms.verify_patient, pa[0], spoken(pa[1]).split()[0]))
+check("wrong phone refused", raises("VERIFICATION_FAILED", pms.verify_patient, pa[0], phone="+96599999999"))
 check("wrong id refused", raises("VERIFICATION_FAILED", pms.verify_patient, 999999999, spoken(pa[1])))
+check("ID alone -> asks for more info", raises("MORE_INFO_NEEDED", pms.verify_patient, pa[0]))
+config.VERIFY_FACTORS_REQUIRED = 0
+check("ID alone works when policy is 0", pms.verify_patient(pa[0])["verified"])
+config.VERIFY_FACTORS_REQUIRED = 1
 pms.reset_security_state()
 for _ in range(3):
     raises("VERIFICATION_FAILED", pms.verify_patient, pb[0], "Nobody Here")
@@ -67,7 +95,7 @@ check("locked after 3 failures", raises("LOCKED_OUT", pms.verify_patient, pb[0],
 pms.reset_security_state()
 ta = pms.verify_patient(pa[0], spoken(pa[1]).upper())["token"]
 tb = pms.verify_patient(pb[0], spoken(pb[1]))["token"]
-check("correct name (any case, no title) accepted", bool(ta and tb))
+check("tokens issued", bool(ta and tb))
 check("no token -> refused", raises("NOT_VERIFIED", pms.get_patient_appointments, "fake"))
 
 print("\n== Catalogue")
