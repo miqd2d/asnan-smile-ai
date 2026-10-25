@@ -43,6 +43,7 @@ STATUS_CANCEL = "Cancel"
 STATUS_RESCHEDULE = "Reschedule"           # closed (old) version of a moved appointment
 CHANGEABLE_STATUSES = (STATUS_BOOK, STATUS_CONFIRM, "Rescheduled")
 
+VERIFY_FACTORS_REQUIRED = 1   # 0 = patient ID only
 
 def get_now() -> datetime:
     """Current time. Set DEMO_NOW=2026-10-26T09:00 to freeze the clock for demos/tests."""
