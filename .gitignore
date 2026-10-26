@@ -1,3 +1,6 @@
 /Data
 /myenv
 .vscode
+/tests
+/src/__pycache__
+/src/agent/__pycache__
