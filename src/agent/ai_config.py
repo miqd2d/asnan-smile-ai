@@ -5,7 +5,7 @@ CLINIC_NAME = os.environ.get("CLINIC_NAME", "Asnan Tower")
 EMERGENCY_NUMBER = "112"                    # Kuwait emergency number
 
 # ---- Model -----------------------------------------------------------------
-LLM_MODEL = os.environ.get("LLM_MODEL", "qwen2.5:3b")
+LLM_MODEL = os.environ.get("LLM_MODEL", "phi4-mini:latest")
 LLM_TEMPERATURE = 0.2                       # low = more reliable tool calls
 LLM_NUM_CTX = 6144                          # context window (tokens); fits a 4 GB GPU with a 3B model
 LLM_KEEP_ALIVE = "30m"                      # keep the model loaded between turns
