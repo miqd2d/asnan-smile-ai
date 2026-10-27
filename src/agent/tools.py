@@ -1,20 +1,26 @@
 """
-tools.py - What the model may DO. Every action goes through here.
+tools.py - What the model may DO: 8 tools. Everything else is done by code.
 
-The model proposes a tool call; this file decides whether it is allowed, injects the
-verification token (the model never sees it), runs the PMS function, and turns any
-RuleError into a message the model can read.
+The model only chooses a tool and its arguments. For anything the caller must hear (times, lists,
+read-backs, results) the tool returns a ready-made "say" text, and the loop speaks THAT.
+Identity is not a model tool: when a tool needs a verified caller, code collects the details itself.
 """
 import logging
-import re
+from datetime import datetime, timedelta
+from difflib import SequenceMatcher
 
 import config
 import pms
-from . import ai_config, calls
-from .dates import normalize_time, resolve_date, weekday_name
+import rules
+from db import connect
 from rules import RuleError
+from slots import get_available_slots
+
+from . import ai_config, calls, speech
+from .dates import normalize_time, resolve_date, weekday_name
 
 log = logging.getLogger("uvicorn.error")
+ANY_WORDS = {"any", "anyone", "anybody", "no preference", "whoever", "أي", "اي", "اي واحد", "أي طبيب"}
 
 
 class ToolArgError(Exception):
@@ -26,48 +32,54 @@ def _fn(name, description, props=None, required=None):
             "parameters": {"type": "object", "properties": props or {}, "required": required or []}}}
 
 
-_INT, _STR, _BOOL = {"type": "integer"}, {"type": "string"}, {"type": "boolean"}
+_INT, _STR = {"type": "integer"}, {"type": "string"}
 
 SCHEMAS = {s["function"]["name"]: s for s in [
-    _fn("find_doctors", "Find bookable doctors, by specialty (unit_id) and/or by name.",
-        {"unit_id": {**_INT, "description": "Specialty id"}, "name": {**_STR, "description": "Doctor name as spoken"}}),
-    _fn("get_slots", "Free start times for ONE doctor on ONE day for a visit type.",
-        {"doctor_id": _INT, "date": {**_STR, "description": "YYYY-MM-DD, or 'tomorrow', 'next sunday'..."},
-         "rov_id": {**_INT, "description": "Visit type id"},
-         "after": {**_STR, "description": "Optional HH:MM, only times after this"},
-         "before": {**_STR, "description": "Optional HH:MM, only times before this"}},
-        ["doctor_id", "date", "rov_id"]),
-    _fn("find_next_available", "Earliest free times across a doctor, a specialty, or all doctors.",
-        {"rov_id": _INT, "unit_id": _INT, "doctor_id": _INT,
-         "from_date": {**_STR, "description": "Optional start day"}}, ["rov_id"]),
-    _fn("verify_patient", "Verify the caller. Needs the patient file number plus phone or name.",
-        {"patient_id": _INT, "phone": _STR, "name": {**_STR, "description": "Any part of the name"}}, ["patient_id"]),
-    _fn("get_my_appointments", "List the verified patient's upcoming appointments."),
-    _fn("book_appointment", "Book a slot that was offered. Only after the caller said yes.",
-        {"doctor_id": _INT, "rov_id": _INT, "date": _STR, "time": {**_STR, "description": "HH:MM"},
-         "notes": {**_STR, "description": "Caller's own words about the problem"},
-         "patient_confirmed": {**_BOOL, "description": "true only after the caller clearly agreed"}},
-        ["doctor_id", "rov_id", "date", "time", "patient_confirmed"]),
-    _fn("reschedule_appointment", "Move an appointment to an offered slot. Only after the caller said yes.",
-        {"appointment_id": {**_INT, "description": "Reference number"}, "new_date": _STR, "new_time": _STR,
-         "new_doctor_id": {**_INT, "description": "Only if changing doctor"}, "patient_confirmed": _BOOL},
-        ["appointment_id", "new_date", "new_time", "patient_confirmed"]),
-    _fn("cancel_appointment", "Cancel an appointment. Only after the caller said yes.",
-        {"appointment_id": {**_INT, "description": "Reference number"}, "patient_confirmed": _BOOL},
-        ["appointment_id", "patient_confirmed"]),
-    _fn("confirm_appointment", "Mark an appointment as confirmed by the patient.",
-        {"appointment_id": {**_INT, "description": "Reference number"}}, ["appointment_id"]),
-    _fn("transfer_to_agent", "Hand the call to a human: complaints, anything you cannot do, repeated confusion.",
-        {"reason": _STR}, ["reason"]),
-    _fn("end_call", "End the call after saying goodbye."),
+    _fn("check_availability",
+        "Look up free appointment times. Use for ANY question about availability, times, or booking a visit, "
+        "and also to find new times when rescheduling. Returns a numbered list of options that the system "
+        "reads to the caller. Pass the visit type, plus the doctor, specialty and day if the caller said them.",
+        {"visit_type_id": {**_INT, "description": "Id from the VISIT TYPES list. Required for a new booking."},
+         "doctor_name": {**_STR, "description": "Doctor's name as the caller said it. Use 'any' if they have no preference."},
+         "specialty_id": {**_INT, "description": "Id from the SPECIALTIES list, when no doctor is named."},
+         "date": {**_STR, "description": "YYYY-MM-DD, or a word: today, tomorrow, wednesday, next sunday, الأربعاء. Leave out for the earliest times."},
+         "after": {**_STR, "description": "HH:MM. Only times later than this (e.g. 'in the evening' = 16:00)."},
+         "before": {**_STR, "description": "HH:MM. Only times earlier than this."},
+         "appointment": {**_INT, "description": "ONLY when rescheduling: the number of the appointment from get_my_appointments."}}),
+    _fn("get_my_appointments",
+        "Show the caller's upcoming appointments as a numbered list. Always use this first when the caller "
+        "wants to see, cancel or change an appointment."),
+    _fn("book_appointment",
+        "Book one of the times that check_availability offered. Pass the option number the caller chose. "
+        "The system then reads the details back and asks the caller to confirm; you do not.",
+        {"option": {**_INT, "description": "Number of the chosen option (1, 2, 3...)."},
+         "notes": {**_STR, "description": "The caller's own words about the problem, if any."}}, ["option"]),
+    _fn("reschedule_appointment",
+        "Move an existing appointment to a new time. First use get_my_appointments, then check_availability "
+        "with appointment=N, then call this with that appointment number and the chosen option number.",
+        {"appointment": {**_INT, "description": "Number of the appointment in the caller's list."},
+         "option": {**_INT, "description": "Number of the new time from check_availability."}},
+        ["appointment", "option"]),
+    _fn("cancel_appointment",
+        "Cancel an existing appointment. First use get_my_appointments, then pass the number of the appointment. "
+        "The system asks the caller to confirm.",
+        {"appointment": {**_INT, "description": "Number of the appointment in the caller's list."}}, ["appointment"]),
+    _fn("transfer_to_agent",
+        "Transfer the call to a human. Use for complaints, prices, insurance, medical questions, anything you "
+        "cannot do, or when the caller asks for a person.", {"reason": _STR}, ["reason"]),
+    _fn("end_call", "End the call. Use when the caller says goodbye or has nothing else to do."),
 ]}
-GATED = {"get_my_appointments", "book_appointment", "reschedule_appointment",
-         "cancel_appointment", "confirm_appointment"}      # need a verified patient
+GATED = {"get_my_appointments", "book_appointment", "reschedule_appointment", "cancel_appointment"}
 
 
 def tools_for(session) -> list[dict]:
-    """Stage-based tool list: appointment tools only exist AFTER verification."""
-    return [s for n, s in SCHEMAS.items() if session.verified or n not in GATED]
+    return list(SCHEMAS.values())             # the same 7 tools every turn: stable for a small model
+
+
+def forget_identity(session) -> None:
+    session.token, session.first_name = None, None
+    session.id_scan_from = len(session.transcript)       # after an expiry, ask again: do not reuse old statements
+    session.events.append({"type": "VERIFY_EXPIRED"})
 
 
 # ----------------------------------------------------------------- helpers
@@ -83,51 +95,18 @@ def _int(args, key, required=True):
         return None
     if isinstance(v, bool):
         raise ToolArgError(f"'{key}' must be a number.")
-    if isinstance(v, str):
-        v = re.sub(r"\D", "", v)               # '1 1 8 8' / '1188' from speech
     try:
         return int(v)
     except (TypeError, ValueError):
+        digits = "".join(c for c in str(v) if c.isdigit())
+        if digits:
+            return int(digits)
         raise ToolArgError(f"'{key}' must be a number.")
 
 
-def _str(args, key, required=True):
+def _str(args, key):
     v = args.get(key)
-    if v in (None, ""):
-        if required:
-            raise ToolArgError(f"'{key}' is required.")
-        return None
-    return str(v).strip()
-
-
-def _date(args, key, required=True):
-    raw = _str(args, key, required)
-    if raw is None:
-        return None
-    d = resolve_date(raw, config.get_now().date())
-    if not d:
-        raise ToolArgError(f"'{key}' is not a valid date. Use YYYY-MM-DD.")
-    return d
-
-
-def _time(args, key):
-    t = normalize_time(_str(args, key))
-    if not t:
-        raise ToolArgError(f"'{key}' is not a valid time. Use HH:MM.")
-    return t
-
-
-def _spread(items: list, n: int) -> list:
-    if len(items) <= n:
-        return items
-    step = (len(items) - 1) / (n - 1)
-    return [items[round(i * step)] for i in range(n)]
-
-
-def _compact(a: dict) -> dict:
-    keys = ("reference_number", "doctor", "unit", "visit_type", "date", "weekday",
-            "time", "duration_min", "status")
-    return {k: a[k] for k in keys}
+    return None if v in (None, "") else str(v).strip()
 
 
 def _event(session, kind, **data):
@@ -137,152 +116,246 @@ def _event(session, kind, **data):
 def do_transfer(session, reason: str) -> int:
     hid = calls.create_handoff(session.id, reason, session.patient_id)
     session.transferred, session.transfer_reason = True, reason
+    session.pending, session.awaiting_identity, session.resume = None, False, None
     _event(session, "TRANSFERRED", reason=reason)
     return hid
 
 
-def _need_yes(args):
-    if args.get("patient_confirmed") is not True:
-        raise RuleError("CONFIRMATION_REQUIRED", "Read the details back to the caller and get a clear yes first, "
-                        "then call again with patient_confirmed=true.")
+def _compact(a: dict) -> dict:
+    keys = ("reference_number", "doctor_id", "doctor", "unit", "visit_type", "date", "weekday",
+            "time", "duration_min", "status")
+    return {k: a[k] for k in keys}
 
 
-def _must_be_offered(session, doctor_id, date, time):
-    if (doctor_id, date, time) not in session.offered:
-        raise RuleError("SLOT_NOT_OFFERED", "Only book a time that get_slots or find_next_available "
-                        "returned in this call. Look up the slots first.")
+def _spread(items: list, n: int) -> list:
+    if len(items) <= n:
+        return items
+    step = (len(items) - 1) / (n - 1)
+    return [items[round(i * step)] for i in range(n)]
 
 
-def _doctor_of(session, ref: int) -> int:
-    if ref not in session.seen_appointments:
-        for a in pms.get_patient_appointments(session.token, upcoming_only=False):
-            session.seen_appointments[a["reference_number"]] = a["doctor_id"]
-    if ref not in session.seen_appointments:
-        raise RuleError("APPOINTMENT_NOT_FOUND", "I could not find that appointment on your record.", 404)
-    return session.seen_appointments[ref]
+def _resolve_doctor(name: str, unit_id):
+    """-> ('one', doctor) | ('ask', [names]) | ('none', None). Ranks by how many spoken words match."""
+    docs = pms.list_doctors(unit_id, name)
+    wanted = rules._tokens(name)
+
+    def score(d):
+        parts = rules._tokens(d["name"])
+        return sum(any(SequenceMatcher(None, w, p).ratio() >= 0.8 for p in parts) for w in wanted)
+    if not docs:
+        return "none", None
+    best = max(score(d) for d in docs)
+    cands = [d for d in docs if score(d) == best]
+    return ("one", cands[0]) if len(cands) == 1 else ("ask", [d["name"] for d in cands])
+
+
+def _resolve_appt(s, value: int) -> dict:
+    if 1 <= value <= len(s.appts):
+        return s.appts[value - 1]
+    for a in s.appts:
+        if a["reference_number"] == value:
+            return a
+    raise RuleError("APPOINTMENT_NOT_LISTED", "Call get_my_appointments first, then use the number "
+                    "of the appointment from that list.")
+
+
+def _gather(docs, days, duration, after, before, earliest, exclude, con):
+    found = []
+    for day in days:
+        for d in docs:
+            for t in get_available_slots(d["doctor_id"], day, duration, earliest=earliest,
+                                         exclude_appointment_id=exclude, con=con):
+                if (after and t <= after) or (before and t >= before):
+                    continue
+                found.append((day, t, d))
+    found.sort(key=lambda x: (x[0], x[1], x[2]["doctor_id"]))
+    return found
+
+
+def _choose(found, single, limit):
+    if single:
+        return _spread(found, limit)
+    first_per_group = {}
+    for f in found:                                    # earliest time for each (day, doctor)
+        first_per_group.setdefault((f[0], f[2]["doctor_id"]), f)
+    return sorted(first_per_group.values(), key=lambda x: (x[0], x[1]))[:limit]
 
 
 # ----------------------------------------------------------------- handlers
-def _find_doctors(s, a):
-    docs = pms.list_doctors(_int(a, "unit_id", False), _str(a, "name", False))[:10]
-    if not docs:
-        return {"doctors": [], "message": "No matching doctor."}
-    return {"doctors": [{"doctor_id": d["doctor_id"], "name": d["name"], "specialty": d["unit"]} for d in docs]}
+def _check_availability(s, a):
+    lang, ctx = s.lang, s.ctx
+    vts = {v["rov_id"]: v for v in pms.list_visit_types()}
+    appt = _resolve_appt(s, _int(a, "appointment")) if a.get("appointment") not in (None, "") else None
+    if appt:
+        duration, rov, vname = appt["duration_min"], None, appt["visit_type"]
+    else:
+        rov = _int(a, "visit_type_id", False) or ctx.get("visit_type_id")
+        if not rov:
+            raise ToolArgError("'visit_type_id' is required: pick it from the VISIT TYPES list.")
+        if rov not in vts:
+            raise RuleError("VISIT_TYPE_NOT_BOOKABLE", "That visit type is not bookable. "
+                            "Choose an id from the VISIT TYPES list.")
+        duration, vname = vts[rov]["duration_min"], vts[rov]["name"]
 
+    unit = _int(a, "specialty_id", False) or ctx.get("specialty_id")
+    name = _str(a, "doctor_name")
+    doctor = None
+    if name and name.lower() in ANY_WORDS:
+        ctx.pop("doctor_id", None); ctx.pop("doctor", None)
+    elif name:
+        status, found = _resolve_doctor(name, unit)
+        if status == "none":
+            return {"say": speech.no_such_doctor(lang)}
+        if status == "ask":
+            return {"say": speech.ask_which_doctor(found, lang)}
+        doctor = found
+    elif appt:
+        doctor = {"doctor_id": appt["doctor_id"], "name": appt["doctor"], "unit": appt.get("unit")}
+    elif ctx.get("doctor_id"):
+        doctor = {"doctor_id": ctx["doctor_id"], "name": ctx["doctor"]}
+    docs = [doctor] if doctor else pms.list_doctors(unit_id=unit)
 
-def _get_slots(s, a):
-    doctor_id, rov_id, date = _int(a, "doctor_id"), _int(a, "rov_id"), _date(a, "date")
-    res = pms.get_slots(doctor_id, date, rov_id)
-    slots = res["slots"]
-    after, before = _str(a, "after", False), _str(a, "before", False)
-    if after:
-        slots = [t for t in slots if t > (normalize_time(after) or "00:00")]
-    if before:
-        slots = [t for t in slots if t < (normalize_time(before) or "23:59")]
-    for t in res["slots"]:
-        s.offered.add((doctor_id, date, t))
-    out = {"doctor_id": doctor_id, "doctor": res["doctor"], "date": date, "weekday": res["weekday"],
-           "visit_type": res["visit_type"], "free_count": len(slots),
-           "slots_shown": _spread(slots, ai_config.MAX_SLOTS_SHOWN)}
-    if not slots:
-        out["message"] = "No free times that day (doctor off, fully booked, or filter too narrow)."
-    return out
+    now = config.get_now()
+    earliest = now + timedelta(minutes=config.BOOKING_MIN_LEAD_MINUTES)
+    date = None
+    if _str(a, "date"):
+        date = resolve_date(_str(a, "date"), now.date())
+        if not date:
+            raise ToolArgError("'date' is not a valid date. Use YYYY-MM-DD or a word like tomorrow.")
+    after = normalize_time(_str(a, "after")) if _str(a, "after") else None
+    before = normalize_time(_str(a, "before")) if _str(a, "before") else None
+    exclude = appt["reference_number"] if appt else None
+    limit = ai_config.MAX_OPTIONS
 
+    def days_from(d0):
+        return [(d0 + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(14)]
+    today = datetime(now.year, now.month, now.day)
 
-def _find_next(s, a):
-    opts = pms.get_next_available(_int(a, "rov_id"), doctor_id=_int(a, "doctor_id", False),
-                                  unit_id=_int(a, "unit_id", False), from_date=_date(a, "from_date", False))
-    for o in opts:
-        s.offered.add((o["doctor_id"], o["date"], o["time"]))
-    return {"options": opts} if opts else {"options": [], "message": "Nothing free in the next two weeks."}
-
-
-def _verify(s, a):
+    con = connect()
     try:
-        r = pms.verify_patient(_int(a, "patient_id"), _str(a, "name", False), _str(a, "phone", False))
-    except RuleError as e:
-        if e.code in ("VERIFICATION_FAILED", "LOCKED_OUT"):
-            s.verify_failures += 1
-            _event(s, "VERIFY_FAILED")
-            if s.verify_failures >= 2 or e.code == "LOCKED_OUT":
-                do_transfer(s, "identity_check_failed")
-                return {**e.to_dict(), "transferred": True}
-        raise
-    s.token, s.patient_id, s.first_name = r["token"], r["patient_id"], r["first_name"]
-    _event(s, "VERIFIED")
-    return {"verified": True, "first_name": r["first_name"]}
+        if date:
+            found = _gather(docs, [date], duration, after, before, earliest, exclude, con)
+            picks = _choose(found, len(docs) == 1, limit)
+            header_none = not picks
+            if header_none:
+                start = datetime.strptime(date, "%Y-%m-%d")
+                picks = _choose(_gather(docs, days_from(max(start, today)), duration, after, before,
+                                        earliest, exclude, con), len(docs) == 1, limit)
+        else:
+            picks = _choose(_gather(docs, days_from(today), duration, after, before, earliest, exclude, con),
+                            False, limit)
+            header_none = False
+    finally:
+        con.close()
+
+    ctx.update({"visit_type_id": rov or ctx.get("visit_type_id"), "visit_type": vname if rov else ctx.get("visit_type"),
+                "specialty_id": unit, "last_day": date})
+    if doctor:
+        ctx["doctor_id"], ctx["doctor"] = doctor["doctor_id"], doctor["name"]
+    s.options = [{"n": i, "doctor_id": d["doctor_id"], "doctor": d["name"], "date": day, "time": t,
+                  "weekday": weekday_name(day), "rov_id": rov, "visit_type": vname}
+                 for i, (day, t, d) in enumerate(picks, 1)]
+    if not s.options:
+        return {"say": speech.nothing_free(lang), "options": []}
+    if header_none:
+        shown = speech.day_str(weekday_name(date), date, lang)
+        return {"say": speech.none_that_day(s.options, shown, lang), "options": s.options}
+    return {"say": speech.options_say(s.options, lang), "options": s.options}
 
 
 def _my_appointments(s, a):
     appts = pms.get_patient_appointments(s.token, upcoming_only=True)
-    for x in appts:
-        s.seen_appointments[x["reference_number"]] = x["doctor_id"]
-    return {"appointments": [_compact(x) for x in appts]} if appts else {"appointments": [], "message": "No upcoming appointments."}
+    s.appts = [{"n": i, **_compact(x)} for i, x in enumerate(appts, 1)]
+    return {"say": speech.appointments_say(s.appts, s.lang), "appointments": s.appts}
+
+
+def _need_options(s, n):
+    if not s.options:
+        raise RuleError("NO_OPTIONS", "No times have been offered yet. Call check_availability first.")
+    if not 1 <= n <= len(s.options):
+        raise RuleError("BAD_OPTION", f"Option {n} does not exist. Choose between 1 and {len(s.options)}.")
+    return s.options[n - 1]
 
 
 def _book(s, a):
-    _need_yes(a)
-    doctor_id, rov_id, date, time = _int(a, "doctor_id"), _int(a, "rov_id"), _date(a, "date"), _time(a, "time")
-    _must_be_offered(s, doctor_id, date, time)
-    notes = (_str(a, "notes", False) or "")[:200] or None
-    appt = pms.create_appointment(s.token, doctor_id, rov_id, date, time, notes)
-    s.seen_appointments[appt["reference_number"]] = doctor_id
-    _event(s, "BOOKED", ref=appt["reference_number"])
-    return {"booked": True, **_compact(appt)}
+    opt = _need_options(s, _int(a, "option"))
+    notes = (_str(a, "notes") or "")[:200] or None
+    s.pending = {"type": "book", "option": opt, "visit_type": opt["visit_type"], "notes": notes}
+    return {"say": speech.readback(s.pending, s.lang), "pending": True}
 
 
 def _reschedule(s, a):
-    _need_yes(a)
-    ref, date, time = _int(a, "appointment_id"), _date(a, "new_date"), _time(a, "new_time")
-    new_doc = _int(a, "new_doctor_id", False)
-    _must_be_offered(s, new_doc or _doctor_of(s, ref), date, time)
-    appt = pms.reschedule_appointment(s.token, ref, date, time, new_doc)
-    s.seen_appointments[ref] = appt["doctor_id"]
-    _event(s, "RESCHEDULED", ref=ref)
-    return {"rescheduled": True, **_compact(appt)}
+    old = _resolve_appt(s, _int(a, "appointment"))
+    opt = _need_options(s, _int(a, "option"))
+    rules.check_enough_notice(datetime.strptime(f"{old['date']} {old['time']}", "%Y-%m-%d %H:%M"), config.get_now())
+    s.pending = {"type": "reschedule", "old": old, "option": opt}
+    return {"say": speech.readback(s.pending, s.lang), "pending": True}
 
 
 def _cancel(s, a):
-    _need_yes(a)
-    ref = _int(a, "appointment_id")
-    appt = pms.cancel_appointment(s.token, ref)
-    _event(s, "CANCELLED", ref=ref)
-    return {"cancelled": True, **_compact(appt)}
-
-
-def _confirm(s, a):
-    ref = _int(a, "appointment_id")
-    appt = pms.confirm_appointment(s.token, ref)
-    _event(s, "CONFIRMED", ref=ref)
-    return {"confirmed": True, **_compact(appt)}
+    old = _resolve_appt(s, _int(a, "appointment"))
+    rules.check_enough_notice(datetime.strptime(f"{old['date']} {old['time']}", "%Y-%m-%d %H:%M"), config.get_now())
+    s.pending = {"type": "cancel", "old": old}
+    return {"say": speech.readback(s.pending, s.lang), "pending": True}
 
 
 def _transfer(s, a):
-    do_transfer(s, (_str(a, "reason", False) or "requested_by_model")[:100])
-    return {"transferred": True}
+    do_transfer(s, (_str(a, "reason") or "requested_by_model")[:100])
+    return {"say": speech.REPLIES_TRANSFER[s.lang], "transferred": True}
 
 
 def _end(s, a):
     s.end_requested = True
-    return {"ok": True, "message": "Say a short goodbye."}
+    return {"say": speech.goodbye(s.lang)}
 
 
-HANDLERS = {"find_doctors": _find_doctors, "get_slots": _get_slots, "find_next_available": _find_next,
-            "verify_patient": _verify, "get_my_appointments": _my_appointments, "book_appointment": _book,
-            "reschedule_appointment": _reschedule, "cancel_appointment": _cancel,
-            "confirm_appointment": _confirm, "transfer_to_agent": _transfer, "end_call": _end}
+HANDLERS = {"check_availability": _check_availability, "get_my_appointments": _my_appointments,
+            "book_appointment": _book, "reschedule_appointment": _reschedule,
+            "cancel_appointment": _cancel, "transfer_to_agent": _transfer, "end_call": _end}
+
+
+def execute_pending(s) -> dict:
+    """Runs the action the caller just said yes to. Returns the event (used for the receipt)."""
+    p, s.pending = s.pending, None
+    if p["type"] == "book":
+        o = p["option"]
+        appt = pms.create_appointment(s.token, o["doctor_id"], o["rov_id"], o["date"], o["time"], p["notes"])
+        kind, ref = "BOOKED", appt["reference_number"]
+    elif p["type"] == "reschedule":
+        o, ref = p["option"], p["old"]["reference_number"]
+        new_doc = o["doctor_id"] if o["doctor_id"] != p["old"]["doctor_id"] else None
+        appt = pms.reschedule_appointment(s.token, ref, o["date"], o["time"], new_doc)
+        kind = "RESCHEDULED"
+    else:
+        ref = p["old"]["reference_number"]
+        appt = pms.cancel_appointment(s.token, ref)
+        kind = "CANCELLED"
+    s.options, s.appts = [], []                          # lists are stale after a change
+    e = {"type": kind, "ref": ref, "appt": _compact(appt)}
+    s.events.append(e)
+    return e
 
 
 def run_tool(session, name: str, args: dict) -> dict:
     """Run one model-requested tool. Always returns a dict; never raises."""
     if name not in HANDLERS:
         return _err("UNKNOWN_TOOL", f"There is no tool called '{name}'.")
-    if name in GATED and not session.verified:
-        return _err("NOT_VERIFIED_YET", "Verify the caller first with verify_patient "
-                    "(patient file number plus phone or name).")
+    args = args if isinstance(args, dict) else {}
+    if name in GATED and not session.verified:           # code, not the model, will collect the details
+        session.awaiting_identity, session.resume = True, {"tool": name, "args": args}
+        return {"need_identity": True}
     try:
-        return HANDLERS[name](session, args if isinstance(args, dict) else {})
+        result = HANDLERS[name](session, args)
+        if session.pending is not None and "call" not in session.pending:
+            session.pending["call"] = {"tool": name, "args": args}
+        return result
     except RuleError as e:
+        if e.code == "NOT_VERIFIED" and name in GATED:
+            forget_identity(session)
+            session.awaiting_identity, session.resume = True, {"tool": name, "args": args}
+            return {"need_identity": True}
+        if e.code in ("TOO_LATE_TO_CHANGE", "NOT_CHANGEABLE", "APPOINTMENT_NOT_FOUND"):
+            return {"say": speech.error_text(e.code, e.message, session.lang), **e.to_dict()}
         return e.to_dict()
     except ToolArgError as e:
         return _err("BAD_ARGUMENTS", str(e))

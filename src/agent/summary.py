@@ -49,23 +49,44 @@ def refs_of(session) -> str:
     return ",".join(str(e["ref"]) for e in session.events if "ref" in e)
 
 
-def _fallback(outcome: str, n_user: int) -> str:
-    return f"Call with {n_user} caller message(s). Outcome: {outcome}."
+_PHRASE = {"BOOKED": "booked a new appointment", "RESCHEDULED": "rescheduled an appointment",
+           "CANCELLED": "cancelled an appointment"}
+_FIRST_PERSON = re.compile(r"\b(I|I'm|I've|you|your)\b|\?", re.I)
+
+
+def _template(session, outcome: str) -> str:
+    """A summary written by code from recorded facts. Used whenever the model's text is unusable."""
+    if outcome == "TRANSFERRED":
+        return f"The call was transferred to a team member (reason: {session.transfer_reason})."
+    done = [_PHRASE[e["type"]] for e in session.events if e["type"] in _PHRASE]
+    if done:
+        return "The patient " + " and ".join(done) + "."
+    return "The caller asked for information; no appointment changes were made."
+
+
+def _clean(text: str, session) -> str | None:
+    text = mask(text).strip()
+    if session.first_name:
+        text = re.sub(re.escape(session.first_name), "the patient", text, flags=re.I)
+    if not text or _FIRST_PERSON.search(text):      # chatty, first-person or a question = not a summary
+        return None
+    return text
 
 
 def build(session, reason: str) -> dict:
     outcome = outcome_of(session, reason)
-    lines = [f"{'Caller' if r == 'user' else 'Assistant'}: {mask(t)}" for r, t in session.transcript]
-    actions = ", ".join(e["type"] for e in session.events if e["type"] not in ("VERIFIED",)) or "none"
-    n_user = sum(1 for r, _ in session.transcript if r == "user")
+    caller_lines = [f"- {mask(t)}" for r, t in session.transcript if r == "user"]    # caller words only
+    actions = ", ".join(e["type"] for e in session.events if e["type"] != "VERIFIED") or "none"
+    summary = None
     try:
         out = llm.chat([
             {"role": "system", "content": "You write short internal call summaries for a dental clinic. "
-             "Write 2 or 3 sentences in English: what the caller wanted and what was done. "
-             "Never include names, phone numbers, ID numbers or reference numbers."},
-            {"role": "user", "content": "Transcript:\n" + "\n".join(lines)[-3500:] +
-             f"\n\nSystem-recorded actions: {actions}\nOutcome: {outcome}"}], [])
-        summary = mask(out["content"]).strip() or _fallback(outcome, n_user)
+             "Write 2 sentences in the third person, in English, starting with 'The caller' or 'The patient'. "
+             "Never include names, phone numbers, ID numbers or reference numbers. Do not address anyone."},
+            {"role": "user", "content": "What the caller said:\n" + "\n".join(caller_lines)[-2500:] +
+             f"\n\nActions recorded by the system: {actions}\nOutcome: {outcome}"}], [])
+        summary = _clean(out["content"], session)
     except Exception:
-        summary = _fallback(outcome, n_user)
-    return {"summary": summary[:600], "outcome": outcome, "follow_up": follow_up_of(session, outcome)}
+        pass
+    return {"summary": (summary or _template(session, outcome))[:600], "outcome": outcome,
+            "follow_up": follow_up_of(session, outcome)}

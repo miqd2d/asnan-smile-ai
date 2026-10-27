@@ -17,8 +17,16 @@ class Session:
     token: str | None = None                           # verification token: NEVER shown to the model
     patient_id: int | None = None
     first_name: str | None = None
-    offered: set = field(default_factory=set)          # (doctor_id, date, time) the system really returned
-    seen_appointments: dict = field(default_factory=dict)  # reference -> doctor_id
+    options: list = field(default_factory=list)       # numbered times last offered: caller says "the second one"
+    appts: list = field(default_factory=list)         # numbered appointments last listed
+    ctx: dict = field(default_factory=dict)           # what the caller already chose (visit type, doctor, specialty, day)
+    pending: dict | None = None                       # an action waiting for the caller's yes/no (run by CODE)
+    awaiting_identity: bool = False                   # code is collecting file number + phone/name
+    resume: dict | None = None                        # the tool call to re-run once identity is verified
+    id_fields: dict = field(default_factory=dict)
+    id_asks: int = 0
+    id_scan_from: int = 0                             # details said before an expiry are not reused
+    lang: str = "en"
     verify_failures: int = 0
     transferred: bool = False
     transfer_reason: str | None = None
@@ -26,6 +34,7 @@ class Session:
     ended: bool = False
     llm_failures: int = 0
     events: list = field(default_factory=list)         # what actually happened (drives the outcome)
+    turn_actions: list = field(default_factory=list)   # successful writes in the CURRENT turn (drives the receipt)
     call_log: dict | None = None
     lock: threading.RLock = field(default_factory=threading.RLock)
 
