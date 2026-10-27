@@ -65,7 +65,157 @@ def _times_in(text: str) -> set[str]:
             out.add(t)
     return out
 
+def _selection_number(text: str) -> int | None:
+    t = (text or "").strip().lower()
 
+    # Normalize Arabic-Indic digits to Western digits.
+    t = t.translate(
+        str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+    )
+
+    # Examples: "1", "1.", "option 1", "number 2",
+    # "appointment 1", "time 3".
+    match = re.match(
+        r"^\s*(?:(?:the|option|number|appointment|time|slot)\s+)*"
+        r"(\d+)(?:st|nd|rd|th)?\b",
+        t,
+    )
+    if match:
+        return int(match.group(1))
+
+    ordinals = {
+        "first": 1, "1st": 1,
+        "second": 2, "2nd": 2,
+        "third": 3, "3rd": 3,
+        "fourth": 4, "4th": 4,
+        "fifth": 5, "5th": 5,
+        "sixth": 6, "6th": 6,
+        "seventh": 7, "7th": 7,
+        "eighth": 8, "8th": 8,
+        "ninth": 9, "9th": 9,
+        "tenth": 10, "10th": 10,
+        "الأول": 1, "الأولى": 1,
+        "الثاني": 2, "الثانية": 2,
+        "الثالث": 3, "الثالثة": 3,
+        "الرابع": 4, "الرابعة": 4,
+        "الخامس": 5, "الخامسة": 5,
+    }
+
+    words = re.findall(r"[a-z0-9']+|[\u0600-\u06FF]+", t)
+
+    # Ordinal phrases: "the first one", "I'll take the second".
+    if len(words) <= 10:
+        for word in words:
+            if word in ordinals:
+                return ordinals[word]
+
+    # Number words are accepted when the caller explicitly frames
+    # them as a selection: "option three", "number one", "time two".
+    number_words = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    }
+
+    selection_words = {
+        "option", "number", "appointment", "time", "slot",
+    }
+
+    if any(word in selection_words for word in words):
+        for word in words:
+            if word in number_words:
+                return number_words[word]
+
+    return None
+
+def _handle_numbered_selection(
+    s,
+    text: str,
+    lang: str,
+) -> str | None:
+    n = _selection_number(text)
+
+    if n is None:
+        return None
+
+    invalid_choice = {
+        "en": "Sorry, that number is not on the list. Please choose one of the listed numbers.",
+        "ar": "عذرًا، هذا الرقم غير موجود في القائمة. يرجى اختيار أحد الأرقام المعروضة.",
+    }
+
+    # Stage 1: the caller is choosing an existing appointment.
+    if (
+        s.appts
+        and not s.options
+        and not s.ctx.get("reschedule_appointment")
+    ):
+        if not 1 <= n <= len(s.appts):
+            return invalid_choice[lang]
+
+        result = tools.run_tool(
+            s,
+            "check_availability",
+            {"appointment": n},
+        )
+
+        if result.get("need_identity"):
+            return _identity_step(s, None, lang)
+
+        if result.get("say"):
+            return result["say"]
+
+        if result.get("error"):
+            return speech.error_text(
+                result["error"],
+                result.get("message", ""),
+                lang,
+            )
+
+        log.warning(
+            "Could not process appointment selection: %s",
+            result,
+        )
+        return BLOCKED[lang]
+
+    # Stage 2: the caller is choosing an offered time.
+    if s.options:
+        if not 1 <= n <= len(s.options):
+            return invalid_choice[lang]
+
+        old_appointment = s.ctx.get("reschedule_appointment")
+
+        if old_appointment is not None:
+            tool_name = "reschedule_appointment"
+            args = {
+                "appointment": old_appointment,
+                "option": n,
+            }
+        else:
+            tool_name = "book_appointment"
+            args = {"option": n}
+
+        result = tools.run_tool(s, tool_name, args)
+
+        if result.get("need_identity"):
+            return _identity_step(s, None, lang)
+
+        if result.get("say"):
+            return result["say"]
+
+        if result.get("error"):
+            return speech.error_text(
+                result["error"],
+                result.get("message", ""),
+                lang,
+            )
+
+        log.warning(
+            "Could not process time selection: %s",
+            result,
+        )
+        return BLOCKED[lang]
+
+    # No active list to select from. Let the normal model flow handle it.
+    return None
 # ------------------------------------------------------------------ lifecycle
 def start_session() -> dict:
     expire_stale_sessions()
@@ -109,25 +259,41 @@ def end_session(session_id: str, reason: str = "user_ended") -> dict:
 # ------------------------------------------------------------------ step 2: yes / no on a read-back
 def _handle_pending(s, text: str, lang: str) -> str | None:
     kind = nlu.classify_reply(text)
+
     if kind == "no":
         s.pending = None
+        s.ctx.pop("reschedule_appointment", None)
         return speech.declined(lang)
+
     if kind == "other":
-        s.pending = None                          # the caller moved on: treat it as a new request
+        s.pending = None
+        s.ctx.pop("reschedule_appointment", None)
         return None
+
     call = s.pending.get("call")
+
     try:
         event = tools.execute_pending(s)
+
     except RuleError as e:
         if e.code == "NOT_VERIFIED":
             tools.forget_identity(s)
             s.awaiting_identity, s.resume = True, call
             return _identity_step(s, None, lang)
-        if e.code in ("SLOT_TAKEN", "DOCTOR_NOT_WORKING", "PATIENT_CONFLICT"):
-            s.options = []
-        return speech.error_text(e.code, e.message, lang)
-    return speech.receipt(event, lang) + speech.ANYTHING_ELSE[lang]
 
+        if e.code in (
+            "SLOT_TAKEN",
+            "DOCTOR_NOT_WORKING",
+            "PATIENT_CONFLICT",
+        ):
+            s.options = []
+            s.ctx.pop("reschedule_appointment", None)
+
+        return speech.error_text(e.code, e.message, lang)
+
+    s.ctx.pop("reschedule_appointment", None)
+
+    return speech.receipt(event, lang) + speech.ANYTHING_ELSE[lang]
 
 # ------------------------------------------------------------------ step 3: identity, collected by code
 def _identity_step(s, text: str | None, lang: str) -> str | None:
@@ -266,11 +432,18 @@ def handle_message(session_id: str, text: str) -> dict:
         s.messages.append({"role": "user", "content": text})
         base = len(s.messages)
         reply = None
-        if s.pending:                                         # 2. yes/no
+        if s.pending:
             reply = _handle_pending(s, text, lang)
-        if reply is None and s.awaiting_identity:             # 3. identity
+
+        if reply is None and s.awaiting_identity:
             reply = _identity_step(s, text, lang)
-        if reply is None:                                     # 4. model
+
+        # Handle numbered and ordinal selections directly in code.
+        # Only do this when identity verification is not in progress.
+        if reply is None and not s.awaiting_identity:
+            reply = _handle_numbered_selection(s, text, lang)
+
+        if reply is None:
             reply = _run_turn(s, lang, text)
         del s.messages[base:]                                 # forget the tool chatter of this turn
         s.messages.append({"role": "assistant", "content": reply})

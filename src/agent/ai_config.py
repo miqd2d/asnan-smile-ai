@@ -11,7 +11,7 @@ LLM_NUM_CTX = 6144                          # context window (tokens); fits a 4 
 LLM_KEEP_ALIVE = "30m"                      # keep the model loaded between turns
 
 # ---- Conversation ------------------------------------------------------------
-MAX_TOOL_ROUNDS = 6                         # model<->tool round trips per caller message
+MAX_TOOL_ROUNDS = 10                         # model<->tool round trips per caller message
 MAX_HISTORY_MESSAGES = 24                   # older messages are dropped from the prompt
 MAX_MESSAGE_CHARS = 1000
 SESSION_TTL_MIN = 30                        # idle calls are closed after this

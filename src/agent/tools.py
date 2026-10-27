@@ -185,7 +185,19 @@ def _choose(found, single, limit):
 def _check_availability(s, a):
     lang, ctx = s.lang, s.ctx
     vts = {v["rov_id"]: v for v in pms.list_visit_types()}
-    appt = _resolve_appt(s, _int(a, "appointment")) if a.get("appointment") not in (None, "") else None
+    appointment_value = a.get("appointment")
+    appt = (
+        _resolve_appt(s, _int(a, "appointment"))
+        if appointment_value not in (None, "")
+        else None
+    )
+
+    if appt:
+        # Remember which existing appointment is being rescheduled.
+        s.ctx["reschedule_appointment"] = appt["n"]
+    else:
+        # A normal availability lookup is for a new booking.
+        s.ctx.pop("reschedule_appointment", None)
     if appt:
         duration, rov, vname = appt["duration_min"], None, appt["visit_type"]
     else:
@@ -256,7 +268,11 @@ def _check_availability(s, a):
                   "weekday": weekday_name(day), "rov_id": rov, "visit_type": vname}
                  for i, (day, t, d) in enumerate(picks, 1)]
     if not s.options:
-        return {"say": speech.nothing_free(lang), "options": []}
+        s.ctx.pop("reschedule_appointment", None)
+        return {
+            "say": speech.nothing_free(lang),
+            "options": [],
+        }
     if header_none:
         shown = speech.day_str(weekday_name(date), date, lang)
         return {"say": speech.none_that_day(s.options, shown, lang), "options": s.options}
@@ -264,9 +280,23 @@ def _check_availability(s, a):
 
 
 def _my_appointments(s, a):
-    appts = pms.get_patient_appointments(s.token, upcoming_only=True)
-    s.appts = [{"n": i, **_compact(x)} for i, x in enumerate(appts, 1)]
-    return {"say": speech.appointments_say(s.appts, s.lang), "appointments": s.appts}
+    s.options = []
+    s.ctx.pop("reschedule_appointment", None)
+
+    appts = pms.get_patient_appointments(
+        s.token,
+        upcoming_only=True,
+    )
+
+    s.appts = [
+        {"n": i, **_compact(x)}
+        for i, x in enumerate(appts, 1)
+    ]
+
+    return {
+        "say": speech.appointments_say(s.appts, s.lang),
+        "appointments": s.appts,
+    }
 
 
 def _need_options(s, n):
@@ -287,9 +317,25 @@ def _book(s, a):
 def _reschedule(s, a):
     old = _resolve_appt(s, _int(a, "appointment"))
     opt = _need_options(s, _int(a, "option"))
-    rules.check_enough_notice(datetime.strptime(f"{old['date']} {old['time']}", "%Y-%m-%d %H:%M"), config.get_now())
-    s.pending = {"type": "reschedule", "old": old, "option": opt}
-    return {"say": speech.readback(s.pending, s.lang), "pending": True}
+
+    rules.check_enough_notice(
+        datetime.strptime(
+            f"{old['date']} {old['time']}",
+            "%Y-%m-%d %H:%M",
+        ),
+        config.get_now(),
+    )
+
+    s.pending = {
+        "type": "reschedule",
+        "old": old,
+        "option": opt,
+    }
+
+    return {
+        "say": speech.readback(s.pending, s.lang),
+        "pending": True,
+    }
 
 
 def _cancel(s, a):
@@ -330,7 +376,8 @@ def execute_pending(s) -> dict:
         ref = p["old"]["reference_number"]
         appt = pms.cancel_appointment(s.token, ref)
         kind = "CANCELLED"
-    s.options, s.appts = [], []                          # lists are stale after a change
+    s.options, s.appts = [], []
+    s.ctx.pop("reschedule_appointment", None)
     e = {"type": kind, "ref": ref, "appt": _compact(appt)}
     s.events.append(e)
     return e
