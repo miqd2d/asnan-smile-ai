@@ -6,7 +6,7 @@ EMERGENCY_NUMBER = "112"                    # Kuwait emergency number
 
 # ---- Model -----------------------------------------------------------------
 LLM_MODEL = os.environ.get("LLM_MODEL", "granite4.1:3b")
-LLM_TEMPERATURE = 0.2                       # low = more reliable tool calls
+LLM_TEMPERATURE = 0.1                       # low = more reliable tool calls
 LLM_NUM_CTX = 6144                          # context window (tokens); fits a 4 GB GPU with a 3B model
 LLM_KEEP_ALIVE = "30m"                      # keep the model loaded between turns
 
@@ -15,7 +15,7 @@ MAX_TOOL_ROUNDS = 6                         # model<->tool round trips per calle
 MAX_HISTORY_MESSAGES = 24                   # older messages are dropped from the prompt
 MAX_MESSAGE_CHARS = 1000
 SESSION_TTL_MIN = 30                        # idle calls are closed after this
-MAX_SLOTS_SHOWN = 6                         # slots the model sees per lookup
+MAX_OPTIONS = 4                             # times offered to the caller at once
 
 # ---- Privacy ---------------------------------------------------------------------
 CALL_LOG_RETENTION_DAYS = 90                # purge_old() deletes summaries older than this
