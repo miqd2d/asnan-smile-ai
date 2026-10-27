@@ -80,11 +80,23 @@ def verify_patient(patient_id: int, name: str | None = None, phone: str | None =
 
 
 def _require_patient(token: str) -> int:
+    """Return the patient behind a valid token, and slide its expiry (idle timeout, not absolute)."""
     entry = _tokens.get(token or "")
-    if not entry or config.get_now() > entry[1]:
+    now = config.get_now()
+    if not entry or now > entry[1]:
         _tokens.pop(token or "", None)
         raise RuleError("NOT_VERIFIED", "Identity must be verified first.", 401)
+    _tokens[token] = (entry[0], now + timedelta(minutes=config.TOKEN_TTL_MIN))
     return entry[0]
+
+
+def touch_token(token: str | None) -> bool:
+    """True (and extend the expiry) if the token is still valid. Called on every chat turn."""
+    try:
+        _require_patient(token or "")
+        return True
+    except RuleError:
+        return False
 
 
 def get_patient_phone(patient_id: int) -> str | None:
