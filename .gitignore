@@ -4,4 +4,5 @@
 /tests
 /src/__pycache__
 /src/agent/__pycache__
+/frontend/node_modules
 
